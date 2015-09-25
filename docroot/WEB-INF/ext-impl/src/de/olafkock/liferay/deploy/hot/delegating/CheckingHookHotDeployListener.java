@@ -6,6 +6,8 @@ import com.liferay.portal.kernel.deploy.hot.HotDeployEvent;
 import com.liferay.portal.kernel.deploy.hot.HotDeployException;
 import com.liferay.portal.kernel.log.Log;
 import com.liferay.portal.kernel.log.LogFactoryUtil;
+import com.liferay.portal.kernel.security.pacl.PACLConstants;
+import com.liferay.portal.kernel.security.pacl.permission.PortalHookPermission;
 import com.liferay.portal.kernel.util.GetterUtil;
 import com.liferay.portal.kernel.util.HttpUtil;
 import com.liferay.portal.kernel.util.StringBundler;
@@ -15,6 +17,7 @@ import com.liferay.portal.kernel.util.Validator;
 import com.liferay.portal.kernel.xml.Document;
 import com.liferay.portal.kernel.xml.Element;
 import com.liferay.portal.kernel.xml.SAXReaderUtil;
+import com.liferay.portal.struts.StrutsActionRegistryUtil;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -56,6 +59,7 @@ public class CheckingHookHotDeployListener extends BaseHotDeployListener {
 	private static List<String> rejectionProtocol = new LinkedList<String>();
 
 	private HookHotDeployListener delegate = new HookHotDeployListener();
+	private Map<String, String> alreadyHookedActions = new HashMap<String, String>();
 	private Map<String, String> alreadyHookedJSPs = new HashMap<String, String>();
 	private Set<String> rejectedServletContexts = new HashSet<String>();
 
@@ -85,8 +89,9 @@ public class CheckingHookHotDeployListener extends BaseHotDeployListener {
 		try {
 			ServletContext servletContext = hotDeployEvent.getServletContext();
 			String servletContextName = servletContext.getServletContextName();
+			ClassLoader portletClassLoader = hotDeployEvent.getContextClassLoader();
 
-			_log.info("Invoking pre-deploy check for duplicate JSPs in " + servletContextName);
+			_log.info("Invoking pre-deploy check for duplicate JSPs and Struts Actions in " + servletContextName);
 
 			String xml = HttpUtil.URLtoString(servletContext
 					.getResource("/WEB-INF/liferay-hook.xml"));
@@ -96,14 +101,32 @@ public class CheckingHookHotDeployListener extends BaseHotDeployListener {
 			Document document = SAXReaderUtil.read(xml, true);
 			Element rootElement = document.getRootElement();
 
-			if (!checkCustomJsp(servletContext, servletContextName, rootElement)) {
+			List<String> hookedJSPs = new LinkedList<String> ();
+			List<String> hookedStrutsActions = new LinkedList<String>();
+			
+			if (!checkCustomJsp(servletContext, servletContextName, rootElement, hookedJSPs)) {
 				rejectedServletContexts.add(servletContextName);
 				_log.error( "Deployment of " + servletContextName
 						  + " rejected due to JSP check failure. Check the log for duplicate hooked JSPs");
-			} else {
-				_log.info("Pre-deploy check for " + servletContextName + " succeeded. Delegating Deployment to original deployer");
-				delegate.invokeDeploy(hotDeployEvent);
+				return;
+			} 
+			if(!checkStrutsActions(portletClassLoader, rootElement, hookedStrutsActions)) {
+				rejectedServletContexts.add(servletContextName);
+				_log.error("Deployment of " + servletContextName
+						+ " rejected due to duplicate Struts Action overloads. Check the log for duplicated Action overrides");
+				return;
 			}
+		
+			for(String hookedJSP: hookedJSPs) {
+				alreadyHookedJSPs.put(hookedJSP, servletContextName);
+			}
+			for(String action: hookedStrutsActions) {
+				alreadyHookedActions.put(action, servletContextName);
+			}
+			// all is well - let's delegate deployment to the original deployer.
+			_log.info("Pre-deploy check for " + servletContextName + " succeeded. Delegating Deployment to original deployer");
+			delegate.invokeDeploy(hotDeployEvent);
+
 		} catch (Throwable t) {
 			throwHotDeployException(
 					hotDeployEvent,
@@ -134,11 +157,17 @@ public class CheckingHookHotDeployListener extends BaseHotDeployListener {
 					alreadyHookedJSPs.remove(jsp);
 				}
 			}
+			keys = new ArrayList<String>(alreadyHookedActions.keySet());
+			for(String action: keys) {
+				if(alreadyHookedActions.get(action).equals(servletContextName)) {
+					alreadyHookedActions.remove(action);
+				}
+			}
 		}
 	}
 
 	protected boolean checkCustomJsp(ServletContext servletContext,
-			String servletContextName, Element rootElement) {
+			String servletContextName, Element rootElement, List<String> collectHookedJSPs) {
 		String customJspDir = rootElement.elementText("custom-jsp-dir");
 
 		if (Validator.isNull(customJspDir)) {
@@ -189,9 +218,7 @@ public class CheckingHookHotDeployListener extends BaseHotDeployListener {
 				}
 			}
 			if (result) {
-				for (String customJsp : customJsps) {
-					alreadyHookedJSPs.put(customJsp, servletContextName);
-				}
+				collectHookedJSPs.addAll(customJsps);
 			}
 		}
 
@@ -222,7 +249,64 @@ public class CheckingHookHotDeployListener extends BaseHotDeployListener {
 			}
 		}
 	}
+	
+	/**
+	 * Check if there is a conflict with already overridden struts actions in other hooks, as 
+	 * well as for correct security manager declaration. 
+	 * 
+	 * @param servletContextName name of the currently checked servletContext
+	 * @param portletClassLoader the plugin's portletClassLoader in order to invoke security checks
+	 * @param parentElement the element to iterate from liferay-hook.xml
+	 * @param collectHookedStrutsActions name of all struts actions, use only when this method returns true
+	 * @return true if there are no conflicts and this hook can be deployed
+	 */
+	protected boolean checkStrutsActions(
+			ClassLoader portletClassLoader,	Element parentElement, 
+			List<String>collectHookedStrutsActions) {
 
+		List<Element> strutsActionElements = parentElement.elements(
+				"struts-action");
+		boolean result = true;
+		
+		for (Element strutsActionElement : strutsActionElements) {
+			String strutsActionPath = strutsActionElement.elementText(
+				"struts-action-path");
+
+			if (!checkPermission(
+					PACLConstants.PORTAL_HOOK_PERMISSION_STRUTS_ACTION_PATH,
+					portletClassLoader, strutsActionPath,
+					"Rejecting struts action path " + strutsActionPath)) {
+
+				result = false;
+			}
+
+			if(StrutsActionRegistryUtil.getAction(strutsActionPath) != null) {
+				_log.error("Struts action " + strutsActionPath + " already overloaded in hook " +
+						alreadyHookedActions.get(strutsActionPath));
+				result = false;
+			}
+
+			collectHookedStrutsActions.add(strutsActionPath);
+			
+		}
+
+		return result;
+	}
+	
+	protected boolean checkPermission(
+		String name, ClassLoader portletClassLoader, Object subject,String message) {
+
+		try {
+			PortalHookPermission.checkPermission(name, portletClassLoader, subject);
+		}
+		catch (SecurityException se) {
+			_log.error(message);
+			return false;
+		}
+		return true;
+	}
+
+	
 	private static Log _log = LogFactoryUtil.getLog(CheckingHookHotDeployListener.class);
 
 }
